@@ -1,0 +1,890 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no"/>
+<title>AquaSense — Water Quality Monitor</title>
+<style>
+  html,body{margin:0;padding:0;background:#f0f4f8;}
+  *{box-sizing:border-box;}
+  #root{min-height:100vh;}
+</style>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+  .leaflet-container{font-family:inherit;background:#dbe9f4;}
+  .aq-pin{width:16px;height:16px;border-radius:50% 50% 50% 0;border:2px solid #fff;transform:rotate(-45deg);box-shadow:0 1px 4px rgba(0,0,0,0.4);}
+  .aq-pin.active{width:24px;height:24px;box-shadow:0 0 0 6px rgba(2,132,199,0.25),0 1px 4px rgba(0,0,0,0.4);}
+  .leaflet-popup-content{margin:8px 10px;font-size:12px;}
+  .leaflet-popup-content b{font-size:12.5px;}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const {useState, useRef, useEffect} = React;
+
+
+// Real Python scikit-learn running in browser via Pyodide WebAssembly
+// Training data: 14 real Gangarama Lake lab measurements
+// Features: 18 colour features from 5 colour spaces
+
+// ── Colour feature extraction ──────────────────────────────────
+function extractFeatures(canvas) {
+  try {
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width, h = canvas.height;
+    const x0=Math.floor(w*0.3), y0=Math.floor(h*0.3);
+    const sw=Math.max(1,Math.floor(w*0.4)), sh=Math.max(1,Math.floor(h*0.4));
+    const d = ctx.getImageData(x0, y0, sw, sh).data;
+    let r=0,g=0,b=0,n=0;
+    for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1];b+=d[i+2];n++;}
+    if(!n)return null;
+    r/=n; g/=n; b/=n;
+    const lin=c=>{c/=255;return c>0.04045?Math.pow((c+0.055)/1.055,2.4):c/12.92;};
+    const rl=lin(r),gl=lin(g),bl_=lin(b);
+    const X=rl*0.4124+gl*0.3576+bl_*0.1805;
+    const Y=rl*0.2126+gl*0.7152+bl_*0.0722;
+    const Z=rl*0.0193+gl*0.1192+bl_*0.9505;
+    const f=v=>v>0.008856?Math.cbrt(v):7.787*v+16/116;
+    const L=116*f(Y)-16, a=500*(f(X/0.9505)-f(Y)), bS=200*(f(Y)-f(Z/1.089));
+    const rn=r/255,gn=g/255,bn=b/255;
+    const mx=Math.max(rn,gn,bn),mn=Math.min(rn,gn,bn),dv=mx-mn;
+    let H=0;
+    if(dv>0){if(mx===rn)H=60*(((gn-bn)/dv)%6);else if(mx===gn)H=60*((bn-rn)/dv+2);else H=60*((rn-gn)/dv+4);}
+    if(H<0)H+=360;
+    const S=mx===0?0:dv/mx, V=mx, tot=r+g+b||1;
+    const GR=rn>0?gn/rn:1, NDI=(gn+rn)>0?(gn-rn)/(gn+rn):0;
+    const brightness=(r+g+b)/3/255, greenIndex=g/tot;
+    const vec=[
+      +L.toFixed(2),+a.toFixed(2),+bS.toFixed(2),
+      Math.round(r),Math.round(g),Math.round(b),
+      +GR.toFixed(3),+NDI.toFixed(3),
+      +H.toFixed(1),+(S*100).toFixed(1),+(V*100).toFixed(1),
+      +X.toFixed(4),+Y.toFixed(4),+Z.toFixed(4),
+      +brightness.toFixed(3),+greenIndex.toFixed(4),+S.toFixed(3),+Math.abs(bS).toFixed(2),
+    ];
+    return {
+      vec,
+      rgb:{r:Math.round(r),g:Math.round(g),b:Math.round(b)},
+      lab:{L:+L.toFixed(1),a:+a.toFixed(1),b:+bS.toFixed(1)},
+      hsv:{H:+H.toFixed(0),S:+(S*100).toFixed(0),V:+(V*100).toFixed(0)},
+      xyz:{X:+X.toFixed(4),Y:+Y.toFixed(4),Z:+Z.toFixed(4)},
+      GR:+GR.toFixed(3),NDI:+NDI.toFixed(3),brightness:+brightness.toFixed(3),greenIndex:+greenIndex.toFixed(3),saturation:+S.toFixed(3),
+    };
+  } catch(e){return null;}
+}
+
+// ── Physics fallback ───────────────────────────────────────────
+function physicsFallback(f) {
+  if(!f)return{turbidity:120,TP:10,EC:460,NH4:8,DO:2.5,pH:7.0,method:"Physics fallback"};
+  const Ln=Math.max(0,Math.min(100,f.lab.L))/100;
+  const turbidity=+(22+(1-Ln)*290+(1-f.hsv.V/100)*40).toFixed(1);
+  const TP=+Math.max(6.57,Math.min(17.13,6.57+f.saturation*8+(1-f.GR)*2)).toFixed(2);
+  const EC=Math.max(399,Math.min(559,Math.round(399+Math.max(0,f.lab.b)*3+(1-f.brightness)*80)));
+  const NH4=+Math.max(5.33,Math.min(15.64,5.33+Math.max(0,f.lab.b)*0.3+(1-Ln)*5)).toFixed(2);
+  const DO=+Math.max(0.79,Math.min(5.27,5.27-(Math.min(312,+turbidity)/312)*3.5-(Math.min(15.64,NH4)/15.64)*0.8)).toFixed(2);
+  const pH=+Math.max(6.71,Math.min(7.28,6.71+(1-Math.min(312,+turbidity)/312)*0.4+DO*0.05)).toFixed(2);
+  return{turbidity:Math.max(22,Math.min(312,+turbidity)),TP,EC,NH4,DO,pH,method:"Colour physics"};
+}
+
+// ── Training data (14 real Gangarama Lake samples) ─────────────
+const X_TRAIN = JSON.stringify([
+  [28.2,-3.1,8.4,62,78,58,1.26,0.11,128,38,31,0.06,0.08,0.06,0.31,0.39,0.38,8.4],
+  [26.8,-2.8,9.1,58,74,52,1.28,0.12,132,41,29,0.05,0.07,0.05,0.29,0.40,0.41,9.1],
+  [27.9,-3.0,8.7,61,77,56,1.26,0.11,130,39,30,0.06,0.08,0.06,0.30,0.39,0.39,8.7],
+  [38.4,-2.1,6.2,88,108,92,1.23,0.10,145,22,42,0.12,0.14,0.13,0.45,0.36,0.22,6.2],
+  [35.1,-2.4,7.1,80,101,84,1.26,0.11,140,25,40,0.10,0.12,0.11,0.42,0.38,0.25,7.1],
+  [36.8,-2.2,6.8,84,105,88,1.25,0.11,142,23,41,0.11,0.13,0.12,0.44,0.37,0.23,6.8],
+  [42.1,-1.8,5.4,98,118,102,1.20,0.09,150,18,46,0.14,0.16,0.15,0.50,0.36,0.18,5.4],
+  [48.3,-1.2,4.1,115,134,120,1.17,0.08,155,14,53,0.18,0.20,0.19,0.58,0.34,0.14,4.1],
+  [58.2,-0.8,2.8,142,158,148,1.11,0.05,162,10,62,0.26,0.29,0.27,0.68,0.33,0.10,2.8],
+  [61.4,-0.5,2.1,152,167,158,1.10,0.05,165,9,66,0.29,0.32,0.30,0.72,0.32,0.09,2.1],
+  [63.8,-0.3,1.8,158,172,164,1.09,0.04,168,8,68,0.31,0.34,0.32,0.75,0.32,0.08,1.8],
+  [66.1,-0.2,1.4,164,178,170,1.09,0.04,170,7,70,0.33,0.36,0.34,0.77,0.31,0.07,1.4],
+  [52.4,-1.1,3.4,128,145,135,1.13,0.06,158,12,57,0.22,0.24,0.23,0.62,0.34,0.12,3.4],
+  [70.2,0.1,0.9,175,188,182,1.07,0.03,172,5,74,0.38,0.41,0.39,0.82,0.31,0.05,0.9],
+]);
+
+const Y_TRAIN = JSON.stringify({
+  turbidity:[300,312,288,282,255,246,148,202,90,46,59,22,66,34],
+  TP:[14.90,13.01,13.08,17.13,10.63,10.91,11.40,11.12,9.09,6.57,9.02,9.23,9.51,10.56],
+  EC:[559,451,460,421,419,456,446,416,420,431,439,432,399,407],
+  NH4:[15.64,9.40,9.13,5.82,6.65,6.29,7.81,5.52,7.19,8.79,11.22,9.82,5.33,5.87],
+  DO:[0.82,0.85,0.79,1.01,1.15,1.04,1.18,0.82,1.11,1.49,1.27,1.23,4.02,5.27],
+  pH:[6.81,6.71,6.86,6.91,6.96,6.95,6.88,7.16,7.18,7.15,7.05,7.28,7.12,7.09],
+});
+
+const FEAT_NAMES=["L*","a*","b*","R","G","B","G/R","NDI","Hue","Sat","Val","X","Y","Z","Bright","GreenIdx","Sat2","|b*|"];
+
+// ── WQI ────────────────────────────────────────────────────────
+function calcWQI(p){
+  const s=Math.round([Math.min(200,(p.turbidity/10)*40),Math.min(200,(p.TP/0.5)*40),Math.max(0,(5.27-p.DO)/4.48*80),Math.abs(p.pH-7.0)*40].reduce((a,b)=>a+b,0)/4);
+  const cat=s<=25?"Good":s<=50?"Moderate":s<=100?"Poor":s<=150?"Very poor":"Unfit";
+  const col={"Good":"#166534","Moderate":"#854d0e","Poor":"#c2410c","Very poor":"#b91c1c","Unfit":"#7f1d1d"}[cat];
+  const bg={"Good":"#dcfce7","Moderate":"#fef9c3","Poor":"#ffedd5","Very poor":"#fee2e2","Unfit":"#fecaca"}[cat];
+  return{score:s,cat,col,bg};
+}
+
+// ── CEA checks ─────────────────────────────────────────────────
+const PARAMS=[
+  {key:"turbidity",label:"Turbidity",unit:"NTU",std:"CEA < 10 NTU",check:v=>v>10},
+  {key:"TP",label:"Total-P",unit:"mg/L",std:"CEA < 0.5 mg/L",check:v=>v>0.5},
+  {key:"EC",label:"EC",unit:"uS/cm",std:"CEA < 750 uS/cm",check:v=>v>750},
+  {key:"DO",label:"DO",unit:"mg/L",std:"CEA >= 5.0 mg/L",check:v=>v<5.0},
+  {key:"pH",label:"pH",unit:"",std:"CEA 6.5-8.5",check:v=>v<6.5||v>8.5},
+  {key:"NH4",label:"NH4+",unit:"mg/L",std:"Eco risk > 1.0 mg/L",check:v=>v>1.0},
+];
+
+const WATER_BODIES=["Gangarama Lake","Beira Lake","Other lake","River","Canal","Pond","Reservoir"];
+
+// ── Styles ─────────────────────────────────────────────────────
+const S={
+  shell:{fontFamily:"system-ui,sans-serif",background:"#f0f4f8",minHeight:"100vh",display:"flex",flexDirection:"column",maxWidth:440,margin:"0 auto"},
+  hdr:{background:"linear-gradient(135deg,#0c4a6e,#075985)",padding:"12px 16px",flexShrink:0,display:"flex",alignItems:"center",justifyContent:"space-between"},
+  body:{flex:1,overflowY:"auto",padding:"14px 16px",paddingBottom:80},
+  card:(x={})=>({background:"#fff",border:"1px solid #e2e8f0",borderRadius:12,padding:"13px 15px",marginBottom:12,...x}),
+  btn:(a,x={})=>({display:"block",width:"100%",padding:"12px 16px",borderRadius:8,border:a?"none":"1px solid #cbd5e1",background:a?"#0369a1":"transparent",color:a?"#fff":"#0f172a",fontSize:14,fontWeight:600,cursor:"pointer",marginBottom:10,textAlign:"center",...x}),
+  lbl:{fontSize:11,fontWeight:600,color:"#64748b",textTransform:"uppercase",letterSpacing:"0.06em",marginBottom:5,display:"block"},
+  nav:{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:440,background:"#0c4a6e",display:"flex",justifyContent:"space-around",padding:"6px 0 8px",zIndex:10},
+  navB:a=>({background:"none",border:"none",cursor:"pointer",padding:"4px 8px",fontSize:10,color:a?"#7dd3fc":"rgba(255,255,255,0.5)",fontWeight:a?600:400,display:"flex",flexDirection:"column",alignItems:"center",gap:2}),
+};
+
+function App(){
+  const [pyStatus,setPyStatus]=useState("loading");
+  const [pyMsg,setPyMsg]=useState("Loading Python...");
+  const [screen,setScreen]=useState("home");
+  const [waterBody,setWaterBody]=useState("Gangarama Lake");
+  const [gps,setGps]=useState(null);
+  const [gpsStatus,setGpsStatus]=useState("idle");
+  const [imgUrl,setImgUrl]=useState(null);
+  const [imgLoading,setImgLoading]=useState(false);
+  const [features,setFeatures]=useState(null);
+  const [running,setRunning]=useState(false);
+  const [log,setLog]=useState([]);
+  const [preds,setPreds]=useState(null);
+  const [wqi,setWqi]=useState(null);
+  const [fi,setFi]=useState(null);
+  const [method,setMethod]=useState("");
+  const [selParam,setSelParam]=useState("turbidity");
+  const [obs,setObs]=useState([]);
+  const [selObs,setSelObs]=useState(null);
+  const [osmStatus,setOsmStatus]=useState("idle"); // idle | submitting | ok | error
+  const [osmError,setOsmError]=useState("");
+  const mapDivRef=useRef(null);
+  const mapRef=useRef(null);
+  const markersRef=useRef({});
+
+  // ── Real OSM map (Leaflet) on the Map screen ──────────────────
+  useEffect(()=>{
+    if(screen!=="map"||!mapDivRef.current)return;
+    const map=L.map(mapDivRef.current,{zoomControl:true,attributionControl:true})
+        .setView([7.8731,80.7718],8); // Sri Lanka default view
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{
+      maxZoom:19,
+      attribution:'&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener noreferrer">OpenStreetMap</a> contributors'
+    }).addTo(map);
+    mapRef.current=map;
+    return ()=>{map.remove();mapRef.current=null;markersRef.current={};};
+  },[screen]);
+
+  useEffect(()=>{
+    const map=mapRef.current;
+    if(screen!=="map"||!map)return;
+    Object.values(markersRef.current).forEach(m=>map.removeLayer(m));
+    markersRef.current={};
+    const pts=[];
+    obs.forEach(o=>{
+      if(!o.gps)return;
+      const lat=parseFloat(o.gps.lat),lng=parseFloat(o.gps.lng);
+      if(Number.isNaN(lat)||Number.isNaN(lng))return;
+      const col=(o.wqi&&o.wqi.col)||"#d97706";
+      const active=selObs&&selObs.id===o.id;
+      const icon=L.divIcon({
+        className:"",
+        html:'<div class="aq-pin'+(active?" active":"")+'" style="background:'+col+'"></div>',
+        iconSize:active?[24,24]:[16,16],
+        iconAnchor:active?[12,22]:[8,15],
+      });
+      const marker=L.marker([lat,lng],{icon}).addTo(map);
+      const osmLink=o.osmNote?('<br/><a href="'+o.osmNote.url+'" target="_blank" rel="noopener noreferrer">view OSM note →</a>'):"<br/><span style=\"color:#94a3b8\">not submitted to OSM</span>";
+      const p=o.preds||{};
+      const wq=[
+        ["Turbidity",p.turbidity!=null?p.turbidity+" NTU":"—"],
+        ["DO",p.DO!=null?p.DO+" mg/L":"—"],
+        ["pH",p.pH!=null?p.pH:"—"],
+        ["Total-P",p.TP!=null?p.TP+" mg/L":"—"],
+        ["EC",p.EC!=null?p.EC+" µS/cm":"—"],
+        ["NH4+",p.NH4!=null?p.NH4+" mg/L":"—"],
+      ].map(([k,v])=>"<div><span style=\"color:#64748b\">"+k+"</span> "+v+"</div>").join("");
+      marker.bindPopup(
+        "<b>"+o.waterBody+"</b><br/>"+
+        "<span style=\"color:#64748b;font-size:11px\">"+o.time+"</span>"+
+        "<div style=\"display:grid;grid-template-columns:1fr 1fr;gap:2px 8px;margin-top:6px;font-size:11.5px\">"+wq+"</div>"+
+        osmLink
+      );
+      marker.on("click",()=>setSelObs(selObs&&selObs.id===o.id?null:o));
+      markersRef.current[o.id]=marker;
+      pts.push([lat,lng]);
+    });
+    if(pts.length===1)map.setView(pts[0],15);
+    else if(pts.length>1)map.fitBounds(pts,{padding:[30,30]});
+  },[screen,obs,selObs]);
+
+  useEffect(()=>{
+    const map=mapRef.current;
+    if(screen!=="map"||!map||!selObs||!selObs.gps)return;
+    const m=markersRef.current[selObs.id];
+    if(m){m.openPopup();map.panTo(m.getLatLng());}
+  },[selObs,screen]);
+  const pyRef=useRef(null);
+  const fileRef=useRef();
+  const canvasRef=useRef();
+
+  // Load Pyodide
+  useEffect(()=>{
+    let alive=true;
+    (async()=>{
+      try{
+        setPyMsg("Fetching Pyodide runtime...");
+        await new Promise((res,rej)=>{
+          if(window.loadPyodide){res();return;}
+          const s=document.createElement("script");
+          s.src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js";
+          s.onload=res;s.onerror=()=>rej(new Error("CDN failed"));
+          document.head.appendChild(s);
+        });
+        if(!alive)return;
+        setPyMsg("Starting Python interpreter...");
+        const py=await window.loadPyodide({indexURL:"https://cdn.jsdelivr.net/pyodide/v0.25.1/full/"});
+        if(!alive)return;
+        setPyMsg("Loading NumPy...");
+        await py.loadPackage("numpy");
+        setPyMsg("Loading scikit-learn...");
+        await py.loadPackage("scikit-learn");
+        if(!alive)return;
+        pyRef.current=py;
+        setPyStatus("ready");
+        setPyMsg("Python + scikit-learn ready");
+      }catch(e){
+        if(alive){setPyStatus("error");setPyMsg("Pyodide unavailable - using physics engine");}
+      }
+    })();
+    return()=>{alive=false;};
+  },[]);
+
+  const addLog=msg=>setLog(p=>[...p,msg]);
+
+  const getGPS=()=>{
+    setGpsStatus("loading");
+    navigator.geolocation?.getCurrentPosition(
+        p=>{setGps({lat:p.coords.latitude.toFixed(5),lng:p.coords.longitude.toFixed(5),acc:Math.round(p.coords.accuracy)});setGpsStatus("ok");},
+        ()=>{setGps({lat:"6.91750",lng:"79.85340",acc:15,demo:true});setGpsStatus("demo");},
+        {timeout:8000,enableHighAccuracy:true}
+    );
+  };
+
+  const handleFile = file => {
+    if (!file) return;
+    setImgLoading(true);
+    setFeatures(null);
+    setPreds(null);
+    setWqi(null);
+    setFi(null);
+    setLog([]);
+
+    const reader = new FileReader();
+    reader.onload = e => {
+      const dataUrl = e.target.result;
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const cv = canvasRef.current;
+          const MAX = 720, scale = Math.min(1, MAX / Math.max(img.width, img.height));
+          cv.width = Math.round(img.width * scale);
+          cv.height = Math.round(img.height * scale);
+          cv.getContext("2d").drawImage(img, 0, 0, cv.width, cv.height);
+          setFeatures(extractFeatures(cv));
+        } catch (e) {
+        }
+        setImgUrl(dataUrl);
+        setImgLoading(false);
+        setScreen("preview");
+      };
+      img.onerror = () => setImgLoading(false);
+      img.src = dataUrl;
+    };
+    reader.onerror = () => setImgLoading(false);
+    reader.readAsDataURL(file);
+  };
+
+  const runPipeline=async()=>{
+    if(!features){alert("No image features. Please take a photo first.");return;}
+    setLog([]);
+    setRunning(true);
+    setScreen("processing");
+
+    addLog("18 colour features extracted from image ROI");
+    addLog("L*="+features.lab.L+" a*="+features.lab.a+" b*="+features.lab.b);
+    addLog("R="+features.rgb.r+" G="+features.rgb.g+" B="+features.rgb.b);
+    addLog("G/R="+features.GR+" Hue="+features.hsv.H+"deg Sat="+features.hsv.S+"%");
+    await new Promise(r=>setTimeout(r,200));
+
+    if(pyRef.current && pyStatus==="ready"){
+      try{
+        addLog("Starting scikit-learn RandomForest...");
+        await new Promise(r=>setTimeout(r,100));
+        addLog("Training RF on Gangarama Lake data (n=14)...");
+        const vecStr=features.vec.join(",");
+        const pyCode=`
+import json, numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
+
+X_train = np.array(${X_TRAIN}, dtype=float)
+y_all = ${Y_TRAIN}
+x_query = np.array([[${vecStr}]], dtype=float)
+results = {}
+fi = {}
+params = {'n_estimators':200,'max_depth':5,'min_samples_split':2,'min_samples_leaf':1,'random_state':42}
+
+for param in ['turbidity','TP','EC','NH4','DO','pH']:
+    y = np.array(y_all[param], dtype=float)
+    sc = StandardScaler()
+    Xs = sc.fit_transform(X_train)
+    xq = sc.transform(x_query)
+    rf = RandomForestRegressor(**params)
+    rf.fit(Xs, y)
+    results[param] = float(rf.predict(xq)[0])
+    fi[param] = rf.feature_importances_.tolist()
+
+results['turbidity'] = max(22.0, min(312.0, results['turbidity']))
+results['TP'] = max(6.57, min(17.13, results['TP']))
+results['EC'] = max(399.0, min(559.0, results['EC']))
+results['NH4'] = max(5.33, min(15.64, results['NH4']))
+results['DO'] = max(0.79, min(5.27, results['DO']))
+results['pH'] = max(6.71, min(7.28, results['pH']))
+
+json.dumps({'preds': results, 'fi': fi})
+`;
+        addLog("Running RF for all 6 parameters...");
+        const raw=await pyRef.current.runPythonAsync(pyCode);
+        const parsed=JSON.parse(raw);
+        const p=parsed.preds;
+        addLog("RF predictions complete");
+        addLog("Turbidity: "+p.turbidity.toFixed(1)+" NTU | DO: "+p.DO.toFixed(2)+" mg/L | pH: "+p.pH.toFixed(2));
+        const result={turbidity:+p.turbidity.toFixed(1),TP:+p.TP.toFixed(2),EC:Math.round(p.EC),NH4:+p.NH4.toFixed(2),DO:+p.DO.toFixed(2),pH:+p.pH.toFixed(2)};
+        setPreds(result);
+        setWqi(calcWQI(result));
+        setFi(parsed.fi);
+        setMethod("scikit-learn RandomForest (Python/Pyodide)");
+      }catch(e){
+        addLog("Python error: "+e.message);
+        addLog("Switching to colour physics engine...");
+        const fb=physicsFallback(features);
+        setPreds(fb);setWqi(calcWQI(fb));setMethod("Colour physics (Python error)");
+      }
+    }else{
+      addLog("Using colour physics engine (Pyodide "+pyStatus+")");
+      await new Promise(r=>setTimeout(r,500));
+      const fb=physicsFallback(features);
+      setPreds(fb);setWqi(calcWQI(fb));setMethod("Colour physics");
+    }
+    setRunning(false);
+    setScreen("results");
+  };
+
+  // ── Submit observation to OpenStreetMap as a public, geotagged Note ─────
+  const submitObs=async()=>{
+    if(!preds||osmStatus==="submitting")return;
+    if(!gps){addLog("No GPS fix — record GPS before submitting to OSM.");return;}
+
+    setOsmStatus("submitting");setOsmError("");
+
+    const text=
+`AquaSense water quality observation
+Water body: ${waterBody}
+Time: ${new Date().toLocaleString()}
+Method: ${method}
+WQI: ${wqi ?? "n/a"}
+Turbidity: ${preds.turbidity} NTU
+Total Phosphorus: ${preds.TP} mg/L
+EC: ${preds.EC} µS/cm
+NH4: ${preds.NH4} mg/L
+DO: ${preds.DO} mg/L
+pH: ${preds.pH}
+GPS accuracy: ${gps.acc}m${gps.demo?" (demo location)":""}
+Photo: captured on-device (OSM Notes API does not support photo attachments)
+Submitted via AquaSense`;
+
+    let osmNote=null, ok=false, errMsg="";
+    try{
+      const url="https://api.openstreetmap.org/api/0.6/notes.json"
+        +"?lat="+encodeURIComponent(gps.lat)
+        +"&lon="+encodeURIComponent(gps.lng)
+        +"&text="+encodeURIComponent(text);
+      const res=await fetch(url,{method:"POST"});
+      if(!res.ok){throw new Error("OSM API responded "+res.status);}
+      const data=await res.json();
+      const noteId=data?.properties?.id ?? data?.id;
+      if(!noteId)throw new Error("No note id returned");
+      osmNote={id:noteId,url:"https://www.openstreetmap.org/note/"+noteId};
+      ok=true;
+    }catch(e){
+      errMsg=e.message||"Network error reaching OSM";
+      ok=false;
+    }
+
+    const o={id:Date.now(),waterBody,gps,preds,wqi,fi,method,imgUrl,features,time:new Date().toLocaleString(),osmNote};
+    setObs(p=>[o,...p]);setSelObs(o);
+    setOsmStatus(ok?"ok":"error");setOsmError(errMsg);
+    setScreen("map");
+  };
+
+  const reset=()=>{
+    setImgUrl(null);setFeatures(null);setPreds(null);setWqi(null);setFi(null);setLog([]);
+    setGps(null);setGpsStatus("idle");setScreen("capture");
+  };
+
+  const activeNav=["preview","processing"].includes(screen)?"capture":screen;
+
+  // ── STATUS BAR ─────────────────────────────────────────────────
+  const PyBar=()=>(
+      <div style={{...S.card({marginBottom:10,padding:"8px 12px"}),background:pyStatus==="ready"?"#f0fdf4":pyStatus==="error"?"#fff7ed":"#eff6ff",border:"1px solid "+(pyStatus==="ready"?"#86efac":pyStatus==="error"?"#fdba74":"#bfdbfe")}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:16}}>{pyStatus==="ready"?"🐍":pyStatus==="error"?"⚠️":"⏳"}</span>
+          <div style={{flex:1}}>
+            <p style={{margin:0,fontSize:12,fontWeight:600,color:pyStatus==="ready"?"#166534":pyStatus==="error"?"#c2410c":"#1e40af"}}>
+              {pyStatus==="ready"?"Python + scikit-learn ready":pyStatus==="error"?"Physics engine active":"Loading Python..."}
+            </p>
+            <p style={{margin:"1px 0 0",fontSize:10,color:"#64748b"}}>{pyMsg}</p>
+          </div>
+          {pyStatus==="loading" ? <div style={{width:14,height:14,borderRadius:"50%",border:"2px solid #bfdbfe",borderTopColor:"#0369a1",animation:"spin 1s linear infinite"}}/> : null}
+        </div>
+        <style>{`@keyframes spin{to{transform:rotate(360deg)}} @keyframes aqp{0%,100%{opacity:0.2;transform:scale(0.7)}50%{opacity:1;transform:scale(1.1)}}`}</style>
+      </div>
+  );
+
+  // ── HOME ────────────────────────────────────────────────────────
+  if(screen==="home") return(
+      <div style={S.shell}>
+        <div style={S.hdr}>
+          <div><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>💧 AquaSense</p><p style={{margin:0,fontSize:10,color:"#93c5fd"}}>scikit-learn RF in browser via Pyodide</p></div>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{width:8,height:8,borderRadius:"50%",background:pyStatus==="ready"?"#4ade80":pyStatus==="error"?"#fb923c":"#fbbf24"}}/>
+            <span style={{fontSize:10,color:"rgba(255,255,255,0.8)"}}>Python {pyStatus}</span>
+          </div>
+        </div>
+        <div style={S.body}>
+          <div style={{...S.card({textAlign:"center",padding:"20px 16px"}),background:"linear-gradient(135deg,#e0f2fe,#f0f9ff)"}}>
+            <div style={{fontSize:44,marginBottom:8}}>💧</div>
+            <p style={{fontSize:19,fontWeight:700,margin:"0 0 4px",color:"#0c4a6e"}}>AquaSense</p>
+            <p style={{fontSize:12,color:"#0369a1",margin:"0 0 10px"}}>Real Python ML running in your browser</p>
+            <div style={{display:"flex",gap:6,justifyContent:"center",flexWrap:"wrap"}}>
+              <span style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:"#0369a1",color:"#fff"}}>🐍 scikit-learn RF</span>
+              <span style={{fontSize:11,padding:"3px 10px",borderRadius:20,background:"#7c3aed",color:"#fff"}}>🎨 18 colour features</span>
+            </div>
+          </div>
+          <PyBar/>
+          <div style={S.card()}>
+            <span style={S.lbl}>pipeline</span>
+            {[["📸","Take photo","30-45 angle, white paper in frame"],["🎨","18 features extracted","L*a*b*, RGB, HSV, XYZ, G/R, NDI"],["🐍","scikit-learn RF in browser","Real Python via WebAssembly (Pyodide)"],["📊","6 parameters predicted","Turbidity, TP, EC, NH4, DO, pH"]].map(([icon,title,sub],i,a)=>(
+                <div key={i} style={{display:"flex",gap:10,padding:"7px 0",borderBottom:i<a.length-1?"1px solid #f1f5f9":"none"}}>
+                  <span style={{fontSize:18,flexShrink:0}}>{icon}</span>
+                  <div><p style={{margin:0,fontSize:13,fontWeight:600,color:"#0f172a"}}>{title}</p><p style={{margin:0,fontSize:11,color:"#64748b"}}>{sub}</p></div>
+                </div>
+            ))}
+          </div>
+          <div style={S.card({background:"#f0fdf4",border:"1px solid #86efac"})}>
+            <p style={{margin:"0 0 3px",fontSize:12,fontWeight:600,color:"#166534"}}>Calibrated to real Gangarama Lake data</p>
+            <p style={{margin:0,fontSize:11,color:"#15803d",lineHeight:1.7}}>n=14 lab samples · turbidity 22-312 NTU · TP 6.57-17.13 mg/L · pH 6.71-7.28 · DO 0.79-5.27 mg/L</p>
+          </div>
+          {obs.length > 0 && (
+              <div style={S.card()}>
+                <p style={{margin:0,fontSize:22,fontWeight:700}}>{obs.length}</p>
+                <p style={{margin:"2px 0 0",fontSize:12,color:"#64748b"}}>observations this session</p>
+              </div>
+          )}
+          <button style={S.btn(true,{fontSize:16,padding:"14px"})} onClick={()=>setScreen("capture")}>start monitoring</button>
+        </div>
+        <div style={S.nav}>
+          {[{id:"home",label:"Home",icon:"🏠"},{id:"capture",label:"Monitor",icon:"📸"},{id:"results",label:"Results",icon:"📊"},{id:"map",label:"Map",icon:"🗺️"}].map(item=>(
+              <button key={item.id} style={S.navB(item.id==="home")} onClick={()=>setScreen(item.id)}>
+                <span style={{fontSize:19}}>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+          ))}
+        </div>
+      </div>
+  );
+
+  // ── CAPTURE ─────────────────────────────────────────────────────
+  if(screen==="capture") return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>💧 Monitor</p></div>
+        <div style={S.body}>
+          <PyBar/>
+          <div style={S.card()}>
+            <span style={S.lbl}>water body</span>
+            <select style={{width:"100%",boxSizing:"border-box",padding:"10px 12px",borderRadius:8,border:"1px solid #cbd5e1",background:"#fff",color:"#0f172a",fontSize:14,marginBottom:12}}
+                    value={waterBody} onChange={e=>setWaterBody(e.target.value)}>
+              {WATER_BODIES.map(w=><option key={w}>{w}</option>)}
+            </select>
+            <span style={S.lbl}>location</span>
+            {gps ? (
+                <div style={{padding:"8px 10px",background:"#f0fdf4",borderRadius:8}}>
+                  <p style={{margin:0,fontSize:12,fontWeight:600,color:"#166534"}}>
+                    {gps.lat}N, {gps.lng}E (acc: {gps.acc}m){gps.demo?" [demo]":""}
+                  </p>
+                </div>
+            ) : (
+                <button style={{...S.btn(false),marginBottom:4}} onClick={getGPS}>
+                  {gpsStatus==="loading"?"locating...":"📍 record GPS"}
+                </button>
+            )}
+          </div>
+          <div style={S.card()}>
+            <span style={S.lbl}>photo tips</span>
+            {["30-45 angle to water surface","White A4 paper visible in frame","Back to the sun","Sharp, well-lit image"].map((t,i,a)=>(
+                <div key={i} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:i<a.length-1?"1px solid #f1f5f9":"none"}}>
+                  <span style={{color:"#16a34a",flexShrink:0}}>✓</span>
+                  <p style={{margin:0,fontSize:13,color:"#0f172a"}}>{t}</p>
+                </div>
+            ))}
+          </div>
+          <canvas ref={canvasRef} style={{display:"none"}}/>
+          <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}}
+                 onChange={e=>{if(e.target.files[0])handleFile(e.target.files[0]);e.target.value="";}}/>
+          <button style={S.btn(true,{fontSize:16,padding:"15px"})} onClick={()=>{fileRef.current.setAttribute("capture","environment");fileRef.current.click();}}>📸 Take Photo</button>
+          <button style={{...S.btn(false,{fontSize:13})}} onClick={()=>{fileRef.current.removeAttribute("capture");fileRef.current.click();}}>🖼️ Upload from Gallery</button>
+        </div>
+        <div style={S.nav}>
+          {[{id:"home",label:"Home",icon:"🏠"},{id:"capture",label:"Monitor",icon:"📸"},{id:"results",label:"Results",icon:"📊"},{id:"map",label:"Map",icon:"🗺️"}].map(item=>(
+              <button key={item.id} style={S.navB(activeNav===item.id)} onClick={()=>setScreen(item.id)}>
+                <span style={{fontSize:19}}>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+          ))}
+        </div>
+      </div>
+  );
+
+  // ── IMAGE LOADING ────────────────────────────────────────────────
+  if(imgLoading) return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>💧 Reading image...</p></div>
+        <div style={S.body}>
+          <div style={{...S.card({textAlign:"center",padding:"48px 20px"})}}>
+            <div style={{fontSize:40,marginBottom:14}}>🖼️</div>
+            <p style={{margin:"0 0 6px",fontSize:15,fontWeight:600}}>Extracting colour features...</p>
+            <p style={{margin:"0 0 20px",fontSize:12,color:"#64748b"}}>Large photos may take a few seconds on mobile</p>
+            <div style={{display:"flex",justifyContent:"center",gap:6}}>
+              {[0,1,2].map(i=><div key={i} style={{width:10,height:10,borderRadius:"50%",background:"#0369a1",animation:"aqp 1.2s ease-in-out "+i*0.2+"s infinite"}}/>)}
+            </div>
+          </div>
+        </div>
+      </div>
+  );
+
+  // ── PREVIEW ──────────────────────────────────────────────────────
+  if(screen==="preview") return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>💧 Preview</p></div>
+        <div style={S.body}>
+          {imgUrl && (
+              <div style={{position:"relative",marginBottom:12}}>
+                <img src={imgUrl} alt="water surface" style={{width:"100%",borderRadius:12,maxHeight:280,objectFit:"cover",display:"block"}}/>
+                <div style={{position:"absolute",top:"30%",left:"30%",width:"40%",height:"40%",border:"2px dashed rgba(255,255,255,0.85)",borderRadius:4,pointerEvents:"none"}}>
+                  <div style={{position:"absolute",top:-22,left:0,fontSize:10,color:"#fff",background:"rgba(0,0,0,0.7)",padding:"2px 7px",borderRadius:3}}>18-feature ROI</div>
+                </div>
+              </div>
+          )}
+          {features ? (
+              <div style={S.card()}>
+                <span style={S.lbl}>colour features extracted</span>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>
+                  {[["L*",features.lab.L],["a*",features.lab.a],["b*",features.lab.b],["R",features.rgb.r],["G",features.rgb.g],["B",features.rgb.b],["G/R",features.GR],["Hue",features.hsv.H],["Sat",features.hsv.S+"%"],["Val",features.hsv.V+"%"],["Green%",(features.greenIndex*100).toFixed(1)],["Bright",(features.brightness*100).toFixed(0)+"%"]].map(([k,v])=>(
+                      <div key={k} style={{padding:"5px 8px",background:"#f8fafc",borderRadius:7}}>
+                        <p style={{margin:0,fontSize:9,color:"#64748b"}}>{k}</p>
+                        <p style={{margin:0,fontSize:12,fontWeight:700,fontFamily:"monospace"}}>{v}</p>
+                      </div>
+                  ))}
+                </div>
+              </div>
+          ) : (
+              <div style={{...S.card({background:"#fff7ed"})}}>
+                <p style={{margin:0,fontSize:13,color:"#c2410c"}}>Colour extraction failed. Analysis will use default estimates.</p>
+              </div>
+          )}
+          <PyBar/>
+          <button style={S.btn(true,{fontSize:15,padding:"14px"})} onClick={runPipeline}>
+            {pyStatus==="ready"?"🐍 Run scikit-learn RandomForest":"🎨 Run Physics Analysis"}
+          </button>
+          <canvas ref={canvasRef} style={{display:"none"}}/>
+          <input ref={fileRef} type="file" accept="image/*" style={{display:"none"}}
+                 onChange={e=>{if(e.target.files[0])handleFile(e.target.files[0]);e.target.value="";}}/>
+          <button style={{...S.btn(false,{fontSize:13})}} onClick={()=>{fileRef.current.removeAttribute("capture");fileRef.current.click();}}>retake photo</button>
+        </div>
+        <div style={S.nav}>
+          {[{id:"home",label:"Home",icon:"🏠"},{id:"capture",label:"Monitor",icon:"📸"},{id:"results",label:"Results",icon:"📊"},{id:"map",label:"Map",icon:"🗺️"}].map(item=>(
+              <button key={item.id} style={S.navB(activeNav===item.id)} onClick={()=>setScreen(item.id)}>
+                <span style={{fontSize:19}}>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+          ))}
+        </div>
+      </div>
+  );
+
+  // ── PROCESSING ───────────────────────────────────────────────────
+  if(screen==="processing") return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>🐍 Running Python...</p></div>
+        <div style={S.body}>
+          {imgUrl && <img src={imgUrl} alt="" style={{width:"100%",borderRadius:12,marginBottom:14,maxHeight:200,objectFit:"cover"}}/>}
+          <div style={S.card()}>
+            <span style={S.lbl}>pipeline log</span>
+            <div style={{fontFamily:"monospace",fontSize:11}}>
+              {log.map((l,i)=>(
+                  <p key={i} style={{margin:"3px 0",color:l.startsWith("Error")?"#dc2626":l.includes("complete")?"#16a34a":"#475569"}}>{l}</p>
+              ))}
+            </div>
+            {running && (
+                <div style={{display:"flex",justifyContent:"center",gap:6,marginTop:12}}>
+                  {[0,1,2].map(i=><div key={i} style={{width:8,height:8,borderRadius:"50%",background:"#0369a1",animation:"aqp 1.2s ease-in-out "+i*0.2+"s infinite"}}/>)}
+                </div>
+            )}
+          </div>
+          <div style={{...S.card({background:"#eff6ff",border:"1px solid #bfdbfe"})}}>
+            <p style={{margin:0,fontSize:12,color:"#1e40af",lineHeight:1.6}}>scikit-learn RandomForest training on 14 real Gangarama Lake samples and predicting from your 18 colour features. Running real Python in your browser via WebAssembly.</p>
+          </div>
+        </div>
+      </div>
+  );
+
+  // ── RESULTS ──────────────────────────────────────────────────────
+  if(screen==="results") return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>📊 Results</p></div>
+        <div style={S.body}>
+          {!preds ? (
+              <div style={S.card({textAlign:"center",padding:"40px 20px"})}>
+                <p style={{color:"#64748b",marginBottom:16}}>No results yet.</p>
+                <button style={{...S.btn(true),width:"auto",display:"inline-block",padding:"10px 20px"}} onClick={()=>setScreen("capture")}>capture photo</button>
+              </div>
+          ) : (
+              <>
+                {imgUrl && <img src={imgUrl} alt="" style={{width:"100%",borderRadius:12,marginBottom:12,maxHeight:170,objectFit:"cover"}}/>}
+
+                <div style={{...S.card({marginBottom:10,padding:"8px 12px"}),background:"#eff6ff",border:"1px solid #bfdbfe"}}>
+                  <p style={{margin:0,fontSize:11,color:"#1e40af"}}>
+                    {method.includes("scikit-learn")?"🐍":"🎨"} {method}
+                  </p>
+                </div>
+
+                {wqi && (
+                    <div style={{...S.card({textAlign:"center",padding:"16px"}),background:wqi.bg,border:"1px solid "+wqi.col+"30"}}>
+                      <p style={{margin:"0 0 2px",fontSize:32,fontWeight:700,color:wqi.col}}>{wqi.score}</p>
+                      <p style={{margin:"0 0 4px",fontSize:16,fontWeight:600,color:wqi.col}}>{wqi.cat}</p>
+                      <p style={{margin:0,fontSize:11,color:wqi.col}}>Water Quality Index</p>
+                    </div>
+                )}
+
+                <div style={S.card()}>
+                  <span style={S.lbl}>CEA threshold decision error</span>
+                  {PARAMS.map((d,i)=>{
+                    const v=preds[d.key];
+                    const exc=d.check(v);
+                    return(
+                        <div key={d.key} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:i<PARAMS.length-1?"1px solid #f1f5f9":"none"}}>
+                          <div>
+                            <p style={{margin:0,fontSize:13,color:"#0f172a"}}>
+                              {d.label}
+                              {d.unit ? <span style={{fontSize:11,color:"#94a3b8",marginLeft:4}}>{d.unit}</span> : null}
+                            </p>
+                            <p style={{margin:"1px 0 0",fontSize:10,color:"#94a3b8"}}>{d.std}</p>
+                          </div>
+                          <div style={{display:"flex",alignItems:"center",gap:8}}>
+                            <span style={{fontSize:15,fontWeight:700}}>{typeof v==="number"?v.toFixed(d.key==="EC"?0:2):v}</span>
+                            <span style={{padding:"3px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:exc?"#fee2e2":"#dcfce7",color:exc?"#b91c1c":"#166534"}}>{exc?"exceed":"ok"}</span>
+                          </div>
+                        </div>
+                    );
+                  })}
+                  <div style={{marginTop:8,padding:"7px 10px",borderRadius:8,background:PARAMS.filter(d=>d.check(preds[d.key])).length>=4?"#fee2e2":PARAMS.filter(d=>d.check(preds[d.key])).length>0?"#fef9c3":"#dcfce7"}}>
+                    <p style={{margin:0,fontSize:12,fontWeight:600,color:PARAMS.filter(d=>d.check(preds[d.key])).length>=4?"#b91c1c":"#166534"}}>
+                      {PARAMS.filter(d=>d.check(preds[d.key])).length}/6 parameters exceed standard
+                    </p>
+                  </div>
+                </div>
+
+                <div style={S.card()}>
+                  <span style={S.lbl}>turbidity vs Gangarama range (22-312 NTU)</span>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:11,color:"#94a3b8",minWidth:28}}>22</span>
+                    <div style={{flex:1,height:10,borderRadius:5,background:"#e2e8f0",overflow:"hidden"}}>
+                      <div style={{height:"100%",width:((preds.turbidity-22)/(312-22)*100)+"%",background:preds.turbidity>100?"#dc2626":preds.turbidity>40?"#d97706":"#16a34a",borderRadius:5}}/>
+                    </div>
+                    <span style={{fontSize:11,color:"#94a3b8",minWidth:28,textAlign:"right"}}>312</span>
+                  </div>
+                  <p style={{margin:"6px 0 0",fontSize:13,fontWeight:700,textAlign:"center"}}>{preds.turbidity} NTU</p>
+                </div>
+
+                {fi && (
+                    <div style={S.card()}>
+                      <span style={S.lbl}>RF feature importance</span>
+                      <select style={{width:"100%",padding:"7px 10px",borderRadius:7,border:"1px solid #e2e8f0",background:"#f8fafc",fontSize:12,marginBottom:8,color:"#0f172a"}}
+                              value={selParam} onChange={e=>setSelParam(e.target.value)}>
+                        {["turbidity","TP","EC","NH4","DO","pH"].map(p=><option key={p} value={p}>{p}</option>)}
+                      </select>
+                      {(()=>{
+                        const vals=fi[selParam]||[];
+                        const mx=Math.max(...vals)||1;
+                        const top5=[...vals.map((v,i)=>({v,name:FEAT_NAMES[i]}))].sort((a,b)=>b.v-a.v).slice(0,5);
+                        return top5.map(({v,name})=>(
+                            <div key={name} style={{display:"flex",alignItems:"center",gap:8,marginBottom:5}}>
+                              <span style={{fontSize:11,color:"#64748b",minWidth:60}}>{name}</span>
+                              <div style={{flex:1,height:8,borderRadius:4,background:"#e2e8f0",overflow:"hidden"}}>
+                                <div style={{height:"100%",width:((v/mx)*100)+"%",background:"#0369a1",borderRadius:4}}/>
+                              </div>
+                              <span style={{fontSize:10,color:"#0369a1",minWidth:36,textAlign:"right"}}>{(v*100).toFixed(0)}%</span>
+                            </div>
+                        ));
+                      })()}
+                      <p style={{margin:"8px 0 0",fontSize:10,color:"#94a3b8"}}>Feature importance shows which colour channels drove the RF prediction for the selected parameter.</p>
+                    </div>
+                )}
+
+                <div style={{...S.card({background:"#f8fafc"})}}>
+                  <p style={{margin:0,fontSize:11,color:"#64748b",lineHeight:1.6}}>{method}. Trained on n=14 Gangarama Lake measurements. Expand training dataset and validate with independent field measurements before scientific deployment.</p>
+                </div>
+
+                {!gps && (
+                    <p style={{margin:"0 0 8px",fontSize:11,color:"#b91c1c",textAlign:"center"}}>⚠️ record GPS on the Monitor screen before submitting to OSM</p>
+                )}
+                <button style={S.btn(true,{fontSize:15,padding:"14px",opacity:osmStatus==="submitting"?0.6:1})} onClick={submitObs} disabled={osmStatus==="submitting"||!gps}>
+                  {osmStatus==="submitting"?"⏳ submitting to OpenStreetMap...":"📍 submit to OSM"}
+                </button>
+                <p style={{margin:"6px 0 0",fontSize:10,color:"#94a3b8",textAlign:"center"}}>Publishes coordinates + water-quality data as a public OSM Note. Photos aren't supported by OSM's API and stay in this app.</p>
+                <button style={S.btn(false)} onClick={reset}>new observation</button>
+              </>
+          )}
+        </div>
+        <div style={S.nav}>
+          {[{id:"home",label:"Home",icon:"🏠"},{id:"capture",label:"Monitor",icon:"📸"},{id:"results",label:"Results",icon:"📊"},{id:"map",label:"Map",icon:"🗺️"}].map(item=>(
+              <button key={item.id} style={S.navB(item.id==="results")} onClick={()=>{if(item.id==="results"&&!preds)return;setScreen(item.id);}}>
+                <span style={{fontSize:19}}>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+          ))}
+        </div>
+      </div>
+  );
+
+  // ── MAP ──────────────────────────────────────────────────────────
+  return(
+      <div style={S.shell}>
+        <div style={S.hdr}><p style={{margin:0,fontSize:15,fontWeight:700,color:"#fff"}}>🗺️ Map</p></div>
+        <div style={S.body}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            <div style={S.card({textAlign:"center",padding:"10px 8px",marginBottom:0})}><p style={{margin:0,fontSize:22,fontWeight:700}}>{obs.length}</p><p style={{margin:"2px 0 0",fontSize:10,color:"#64748b"}}>observations</p></div>
+            <div style={S.card({textAlign:"center",padding:"10px 8px",marginBottom:0})}><p style={{margin:0,fontSize:22,fontWeight:700,color:"#b91c1c"}}>{obs.reduce((a,o)=>a+PARAMS.filter(d=>d.check(o.preds?.[d.key]||0)).length,0)}</p><p style={{margin:"2px 0 0",fontSize:10,color:"#64748b"}}>exceedances</p></div>
+          </div>
+
+          <div style={{...S.card({padding:0}),overflow:"hidden",position:"relative",height:240}}>
+            <div ref={mapDivRef} style={{position:"absolute",inset:0,zIndex:0}}/>
+            {obs.length===0 && (
+                <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",zIndex:1,pointerEvents:"none"}}>
+                  <p style={{color:"#0c4a6e",background:"rgba(255,255,255,0.85)",padding:"6px 12px",borderRadius:8,fontSize:12,textAlign:"center"}}>Submit an observation to pin it here</p>
+                </div>
+            )}
+            <div style={{position:"absolute",bottom:8,right:8,background:"rgba(0,0,0,0.65)",padding:"4px 8px",borderRadius:6,display:"flex",gap:8,zIndex:1000}}>
+              {[["#166534","Good"],["#854d0e","Mod"],["#b91c1c","Poor"]].map(([c,l])=>(
+                  <div key={l} style={{display:"flex",alignItems:"center",gap:4}}>
+                    <div style={{width:7,height:7,borderRadius:"50%",background:c}}/>
+                    <span style={{fontSize:9,color:"rgba(255,255,255,0.8)"}}>{l}</span>
+                  </div>
+              ))}
+            </div>
+          </div>
+
+          {selObs && (
+              <div style={{...S.card({borderLeft:"3px solid "+(selObs.wqi?.col||"#64748b"),borderRadius:"0 12px 12px 0"}),marginTop:10}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:8}}>
+                  <div>
+                    <p style={{margin:0,fontSize:13,fontWeight:600}}>{selObs.waterBody}</p>
+                    <p style={{margin:"2px 0 0",fontSize:11,color:"#64748b"}}>{selObs.time}</p>
+                  </div>
+                  {selObs.wqi && (
+                      <span style={{padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:selObs.wqi.bg,color:selObs.wqi.col}}>
+                  WQI {selObs.wqi.score} - {selObs.wqi.cat}
+                </span>
+                  )}
+                </div>
+                {selObs.imgUrl && <img src={selObs.imgUrl} alt="" style={{width:"100%",height:90,objectFit:"cover",borderRadius:8,marginBottom:8}}/>}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:5}}>
+                  {[["Turbidity",selObs.preds?.turbidity+" NTU"],["DO",selObs.preds?.DO+" mg/L"],["pH",selObs.preds?.pH],["Total-P",selObs.preds?.TP+" mg/L"],["EC",selObs.preds?.EC+" µS/cm"],["NH4+",selObs.preds?.NH4+" mg/L"]].map(([k,v])=>(
+                      <div key={k} style={{padding:"4px 6px",background:"#f8fafc",borderRadius:6}}>
+                        <p style={{margin:0,fontSize:9,color:"#64748b"}}>{k}</p>
+                        <p style={{margin:0,fontSize:12,fontWeight:700}}>{v}</p>
+                      </div>
+                  ))}
+                </div>
+                <p style={{margin:"8px 0 0",fontSize:10,color:"#94a3b8"}}>{selObs.method}</p>
+                {selObs.osmNote ? (
+                    <a href={selObs.osmNote.url} target="_blank" rel="noopener noreferrer"
+                       style={{display:"block",marginTop:8,fontSize:11,fontWeight:600,color:"#0369a1",textDecoration:"none"}}>
+                      🌍 view on OpenStreetMap (note #{selObs.osmNote.id}) →
+                    </a>
+                ) : selObs.id===obs[0]?.id && osmStatus==="error" ? (
+                    <p style={{margin:"8px 0 0",fontSize:10,color:"#b91c1c"}}>⚠️ OSM submission failed: {osmError||"unknown error"}. Saved locally only.</p>
+                ) : null}
+              </div>
+          )}
+
+          {obs.length > 0 && (
+              <div style={S.card({marginTop:8})}>
+                <span style={S.lbl}>observations</span>
+                {obs.map((o,i)=>{
+                  const g=o.wqi||{cat:"Unknown",col:"#64748b",bg:"#f3f4f6"};
+                  return(
+                      <div key={o.id} onClick={()=>setSelObs(selObs?.id===o.id?null:o)}
+                           style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:i<obs.length-1?"1px solid #f1f5f9":"none",cursor:"pointer"}}>
+                        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                          <div style={{width:10,height:10,borderRadius:"50%",background:g.col,flexShrink:0}}/>
+                          <div>
+                            <p style={{margin:0,fontSize:13,fontWeight:600}}>{o.waterBody}</p>
+                            <p style={{margin:0,fontSize:11,color:"#64748b"}}>{o.time}</p>
+                          </div>
+                        </div>
+                        <div style={{textAlign:"right"}}>
+                          <span style={{padding:"2px 9px",borderRadius:20,fontSize:11,fontWeight:600,background:g.bg,color:g.col}}>{g.cat}</span>
+                          <p style={{margin:"2px 0 0",fontSize:10,color:"#94a3b8"}}>{o.preds?.turbidity?.toFixed(0)} NTU</p>
+                        </div>
+                      </div>
+                  );
+                })}
+              </div>
+          )}
+
+          <button style={{...S.btn(true),marginTop:8}} onClick={reset}>add observation</button>
+        </div>
+        <div style={S.nav}>
+          {[{id:"home",label:"Home",icon:"🏠"},{id:"capture",label:"Monitor",icon:"📸"},{id:"results",label:"Results",icon:"📊"},{id:"map",label:"Map",icon:"🗺️"}].map(item=>(
+              <button key={item.id} style={S.navB(item.id==="map")} onClick={()=>{if(item.id==="results"&&!preds)return;setScreen(item.id);}}>
+                <span style={{fontSize:19}}>{item.icon}</span>
+                <span>{item.label}</span>
+              </button>
+          ))}
+        </div>
+      </div>
+  );
+}
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
